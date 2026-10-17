@@ -1,0 +1,16 @@
+{
+  "_comment": "Seed list = English voice IDs documented today in AssemblyAI's Voice Agent API docs (https://www.assemblyai.com/docs/voice-agents). REPLACE/EXTEND with the official per-service voice list from the AssemblyAI TTS docs. Entries may be strings or objects; characters.py accepts both. The backend fails with a clear error if this file has fewer voices than selected characters.",
+  "voices": [
+    {"id": "alba", "label": "Alba", "accent": "UK"},
+    {"id": "anna", "label": "Anna", "accent": "UK"},
+    {"id": "charles", "label": "Charles", "accent": "UK"},
+    {"id": "eve", "label": "Eve", "accent": "US"},
+    {"id": "george", "label": "George", "accent": "US"},
+    {"id": "jane", "label": "Jane", "accent": "US"},
+    {"id": "jean", "label": "Jean", "accent": "US"},
+    {"id": "mary", "label": "Mary", "accent": "US"},
+    {"id": "michael", "label": "Michael", "accent": "US"},
+    {"id": "paul", "label": "Paul", "accent": "UK"},
+    {"id": "vera", "label": "Vera", "accent": "UK"}
+  ]
+}
