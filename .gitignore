@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+dist/
+.env
+.env.local
+.tts_cache/
+api_log.jsonl
+test_tts_out/
+.DS_Store
