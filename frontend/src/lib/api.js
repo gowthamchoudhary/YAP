@@ -1,11 +1,23 @@
-// Backend base: vite dev proxy handles /api in development; override with VITE_API_URL
-// if the backend lives elsewhere (e.g. a phone on the LAN: http://192.168.x.x:8000).
-export const API_BASE = import.meta.env.VITE_API_URL || "";
+// Backend base for REST + WebSocket.
+//
+// Resolution order:
+//   1. VITE_API_BASE (e.g. http://localhost:8000) — absolute, hits backend directly
+//      (CORS on the backend already allows http://localhost:5173).
+//   2. VITE_API_URL — legacy name kept working.
+//   3. "" — same origin: the Vite dev proxy carries /api and /ws to
+//      BACKEND_URL || http://localhost:8000 (see vite.config.js).
+export const API_BASE = import.meta.env.VITE_API_BASE || import.meta.env.VITE_API_URL || "";
 
 export async function listModes() {
   const r = await fetch(`${API_BASE}/api/modes`);
   if (!r.ok) throw new Error(`GET /api/modes failed: ${r.status}`);
   return r.json();
+}
+
+export async function listVoices() {
+  const r = await fetch(`${API_BASE}/api/voices`);
+  if (!r.ok) throw new Error(`GET /api/voices failed: ${r.status}`);
+  return r.json(); // { voices: [ids] }
 }
 
 export async function createScene(blob) {
@@ -25,7 +37,12 @@ export function audioUrl(url) {
 }
 
 export function wsUrl(path) {
-  const base = `${API_BASE}` || window.location.origin;
+  const base = API_BASE;
+  if (!base) {
+    // same origin -> use the Vite dev proxy
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${proto}//${window.location.host}${path}`;
+  }
   const proto = base.startsWith("https") ? "wss" : "ws";
   return `${proto}://${base.replace(/^https?:\/\//, "")}${path}`;
 }

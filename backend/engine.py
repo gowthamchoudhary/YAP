@@ -178,8 +178,10 @@ class EngineSession:
             if len(objects) > self.mode.get("cap", 4):
                 objects = objects[: self.mode.get("cap", 4)]
             self.difficulty = str(data.get("difficulty") or "normal")
+            # per-character Setup-screen edits: {object_id: {name, traits, voice_id}}
+            edits = data.get("character_edits") if isinstance(data.get("character_edits"), dict) else None
 
-            chars_out = await characters_mod.build_characters(objects, self.mode, self.difficulty)
+            chars_out = await characters_mod.build_characters(objects, self.mode, self.difficulty, edits=edits)
             roles = {r["role"]: r for r in self.mode.get("roles", [])}
             self.relationships = chars_out.get("relationships", [])
             self.characters = [
@@ -214,6 +216,8 @@ class EngineSession:
                             "voice_id": c["voice_id"],
                             "catchphrase": c["catchphrase"],
                             "personality": c["personality"],
+                            "traits": (edits or {}).get(c["object_id"], {}).get("traits", []),
+                            "speaking_habit": c.get("speaking_habit", ""),
                             "starts_silent": c["starts_silent"],
                         }
                         for c in self.characters

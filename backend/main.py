@@ -1,4 +1,4 @@
-"""YAP / The Living World — backend app.
+"""YAP — backend app.
 
 Run:  python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI):
     apilog.log_call(service="app", endpoint="shutdown", status="ok", latency_ms=0.0)
 
 
-app = FastAPI(title="YAP / The Living World", lifespan=lifespan)
+app = FastAPI(title="YAP", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in CORS_ORIGINS if o.strip()],
@@ -59,6 +59,14 @@ async def health() -> dict[str, Any]:
 @app.get("/api/modes")
 async def modes() -> list[dict[str, Any]]:
     return engine.load_modes()
+
+
+@app.get("/api/voices")
+async def voices() -> dict[str, Any]:
+    """Voice list for the Setup screen's per-character voice selector."""
+    import characters as characters_mod
+
+    return {"voices": characters_mod.load_voices()}
 
 
 @app.get("/api/tts_capabilities")

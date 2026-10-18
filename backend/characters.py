@@ -65,6 +65,40 @@ def _max_objects_from_mode(mode: dict[str, Any]) -> int:
     return max(3, min(n, 4))
 
 
+def apply_user_edits(
+    result: dict[str, Any],
+    edits: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Apply per-character edits from the Setup screen onto the LLM result.
+
+    edits shape: {object_id: {"name": str?, "traits": [str, ...], "voice_id": str?}}.
+    Names override; traits are merged into the personality text; voice overrides the
+    assigned voice (still validated to exist in voices.json).
+    """
+    if not isinstance(edits, dict) or not edits:
+        return result
+    valid_voice_ids: set[str] = set()
+    try:
+        valid_voice_ids = set(load_voices())
+    except Exception:  # noqa: BLE001 - voice list broken => ignore voice edits
+        pass
+    for c in result["characters"]:
+        edit = edits.get(c["object_id"])
+        if not isinstance(edit, dict):
+            continue
+        new_name = str(edit.get("name") or "").strip()[:32]
+        if new_name:
+            c["name"] = new_name
+        traits = [str(t).strip() for t in (edit.get("traits") or []) if str(t).strip()]
+        if traits:
+            trait_text = "Tone: "+", ".join(traits) + "."
+            c["personality"] = (c["personality"] + " " + trait_text).strip()[:400]
+        voice = str(edit.get("voice_id") or "").strip()
+        if voice and voice in valid_voice_ids:
+            c["voice_id"] = voice
+    return result
+
+
 def _build_prompt(
     objects: list[dict[str, Any]],
     mode: dict[str, Any],
@@ -161,9 +195,15 @@ def _validate(chars_raw: dict[str, Any], objects: list[dict[str, Any]], mode: di
 
 
 async def build_characters(
-    objects: list[dict[str, Any]], mode: dict[str, Any], difficulty: str | None = None
+    objects: list[dict[str, Any]],
+    mode: dict[str, Any],
+    difficulty: str | None = None,
+    edits: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """objects: scene objects chosen by user; mode: loaded mode dict."""
+    """objects: scene objects chosen by user; mode: loaded mode dict.
+
+    edits: per-object user tweaks from the Setup screen (see apply_user_edits).
+    """
     count = len(objects)
     if count < 1:
         raise RuntimeError("No objects selected; nothing to turn into characters.")
@@ -218,6 +258,9 @@ async def build_characters(
     voices = assign_voices(len(result["characters"]))
     for c, voice in zip(result["characters"], voices):
         c["voice_id"] = voice
+
+    # user personality edits from the Setup screen (name/traits/voice) — applied last
+    result = apply_user_edits(result, edits)
 
     print(
         f"[characters] built {len(result['characters'])} characters in {latency:.0f}ms: "

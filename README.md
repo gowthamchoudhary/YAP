@@ -1,4 +1,4 @@
-# YAP — The Living World
+# YAP
 
 Voice-first bringing objects to life: photograph a desk, a garden, a bed… a vision
 model finds the objects, you pick a mode and the objects, and each pick becomes an
@@ -35,34 +35,49 @@ llm → scene → characters → decider → engine (text-only) → tts → fron
 
 ## Setup (Windows 10)
 
+Run the backend (uvicorn) and frontend (vite dev) side by side in two windows:
+
+**Window 1 — backend (FastAPI on :8000):**
+
 ```bat
-:: ---- backend ----
-mkdir backend
-cd backend
+cd YAP\backend
 python -m venv .venv
 .venv\Scripts\activate
-cd ..
-pip install -r backend\requirements.txt      (run from repo root; activate venv first)
+pip install -r requirements.txt
 
-:: env: copy the template and fill it in
-copy env.example backend\.env
-notepad backend\.env                          :: GROQ_API_KEY, ASSEMBLYAI_API_KEY, ...
+copy ..\env.example .env
+notepad .env                              :: fill in GROQ_API_KEY + ASSEMBLYAI_API_KEY
 
-:: run the backend
-cd backend
 python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+:: http://localhost:8000/api/health should return {"ok": true, ...}
 ```
 
+**Window 2 — frontend (Vite on :5173, a NEW terminal window):**
+
 ```bat
-:: ---- frontend (new window) ----
-cd frontend
+cd YAP\frontend
 npm install
-npm run dev                                   :: http://localhost:5173
+:: optional: see env.local.example.md to point at a non-proxied backend (VITE_API_BASE);
+:: the vite proxy handles plain local dev with no env file at all
+npm run dev
+:: open http://localhost:5173
 ```
 
 Open http://localhost:5173 (localhost is a secure context, so the camera and mic work).
 The Vite dev server proxies `/api` and `/ws` to `http://localhost:8000`
-(override with `BACKEND_URL` or `VITE_API_URL`).
+(override with `BACKEND_URL` or `VITE_API_BASE`). CORS on the backend already
+allows `http://localhost:5173`.
+
+**Sanity check BEFORE opening the UI** (proves the core engine loop works with
+no backend/UI running):
+
+```bat
+cd YAP\backend
+.venv\Scripts\activate
+set TTS_DISABLED=1
+python ..\scripts\test_engine_text_only.py ..\scripts\tmp_photo.jpg
+:: expect ~12 character lines + the conspiracy reveal, no API errors
+```
 
 ### Secrets / env vars (see `env.example`)
 

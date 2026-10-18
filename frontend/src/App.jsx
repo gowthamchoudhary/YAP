@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { listModes } from "./lib/api.js";
+import HomeScreen from "./screens/Home.jsx";
 import CaptureScreen from "./screens/Capture.jsx";
 import SetupScreen from "./screens/Setup.jsx";
 import StageScreen from "./screens/Stage.jsx";
@@ -8,8 +9,9 @@ import DebugDrawer from "./components/DebugDrawer.jsx";
 const KEY = "\u0060"; // backtick toggles the debug drawer
 
 export default function App() {
-  const [screen, setScreen] = useState("capture"); // capture | setup | stage
-  const [sceneData, setSceneData] = useState(null); // {scene_id, objects}
+  const [screen, setScreen] = useState("home"); // home | capture | setup | stage
+  const [sceneData, setSceneData] = useState(null); // {scene_id, objects, image_blob}
+  const [characterEdits, setCharacterEdits] = useState(null); // Setup personality edits
   const [modes, setModes] = useState([]);
   const [modeId, setModeId] = useState("conspiracy");
   const [difficulty, setDifficulty] = useState("normal");
@@ -39,19 +41,17 @@ export default function App() {
     setDebugEvents((prev) => [...prev.slice(-200), { at: new Date().toLocaleTimeString(), ...ev }]);
   }, []);
 
-  const onSceneReady = useCallback((data) => {
-    setSceneData(data);
-    setScreen("setup");
-  }, []);
-
-  const onSessionEnded = useCallback((summary) => {
-    pushDebug({ kind: "ended", summary });
-  }, [pushDebug]);
-
   return (
-    <div className={`app accent-${modeId}`}>
+    <div className="yap-app">
+      {screen === "home" && <HomeScreen onGetStarted={() => setScreen("capture")} />}
       {screen === "capture" && (
-        <CaptureScreen onImageReady={onSceneReady} />
+        <CaptureScreen
+          onImageReady={(data) => {
+            setSceneData(data);
+            setScreen("setup");
+          }}
+          onBack={() => setScreen("home")}
+        />
       )}
       {screen === "setup" && sceneData && (
         <SetupScreen
@@ -64,7 +64,10 @@ export default function App() {
           selected={selected}
           setSelected={setSelected}
           onRetake={() => setScreen("capture")}
-          onStart={() => setScreen("stage")}
+          startWithEdits={(edits) => {
+            setCharacterEdits(edits); // sent to /ws/session by the Stage screen
+            setScreen("stage");
+          }}
         />
       )}
       {screen === "stage" && sceneData && (
@@ -74,23 +77,23 @@ export default function App() {
           modeName={modes.find((m) => m.id === modeId)?.name || modeId}
           difficulty={difficulty}
           selected={selected}
-          onChangeMode={() => {
-            // Same photo, different mode: back to Setup keeping the scene + selection
-            setScreen("setup");
-          }}
+          characterEdits={characterEdits}
+          onChangeMode={() => setScreen("setup")}
           onRetake={() => {
             setSceneData(null);
             setSelected([]);
             setScreen("capture");
           }}
+          onBackHome={() => setScreen("home")}
           onDebug={pushDebug}
-          onEnded={onSessionEnded}
         />
       )}
       <DebugDrawer open={debugOpen} events={debugEvents} onClose={() => setDebugOpen(false)} />
-      <footer className="app-hint">
-        YAP · press <kbd>{KEY}</kbd> for the debug drawer
-      </footer>
+      {screen !== "home" && (
+        <footer className="app-hint">
+          YAP · press <kbd>{KEY}</kbd> for the debug drawer
+        </footer>
+      )}
     </div>
   );
 }
