@@ -15,9 +15,14 @@ NOTE: this is a text-only loop; every line is a real LLM output.
 """
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
+
+# this test is TEXT-ONLY by design (see docstring): force TTS off BEFORE any
+# engine/tts import so lines never open real Voice Agent sessions
+os.environ["TTS_DISABLED"] = os.environ.get("TTS_DISABLED", "1")
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "backend"))
@@ -75,12 +80,15 @@ async def main() -> None:
         print(f"   {o.get('id')} {o.get('label')}")
 
     # build the pydantic models exactly like POST /api/scene does
+    import time as _time
+
     from scene import Scene, SceneObject
 
     scene_mod._store_scene(
         Scene(
             scene_id="test",
             image_mime="image/jpeg",
+            created_at=_time.time(),
             objects=[
                 SceneObject(
                     id=o["id"],
@@ -108,7 +116,9 @@ async def main() -> None:
         while not session.ended:
             line = session.pending
             if line is not None:
-                await asyncio.sleep(min(2.0, (line.get("caption_ms") or 2000) / 1000))
+                await asyncio.sleep(min(1.6, (line.get("caption_ms") or 2000) / 1000))
+                if line.get("type") == "line":
+                    print(f"  [played #{session.spoken_count}] {line.get('speaker_name')}: {line.get('text', '')[:80]}", flush=True)
                 await session.handle_event({"type": "played", "line_id": line["line_id"]})
             await asyncio.sleep(0.1)
 
@@ -127,7 +137,7 @@ async def main() -> None:
 
     intruder = asyncio.create_task(user_intrusions())
 
-    deadline = time.monotonic() + 180
+    deadline = time.monotonic() + 150  # inside the 180s command window
     while not session.ended and session.spoken_count < TURNSAsked and time.monotonic() < deadline:
         await asyncio.sleep(0.2)
     if not session.ended:
