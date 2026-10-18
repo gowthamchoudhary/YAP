@@ -23,15 +23,15 @@ never targeting real people.
 
 - **backend/** — Python, FastAPI, uvicorn, httpx, websockets, python-dotenv, pydantic. Sessions in memory, no database.
 - **frontend/** — React + Vite, plain JavaScript (no TypeScript).
-- Text LLM: Groq (`GROQ_TEXT_MODEL`, default `llama-3.3-70b-versatile`). Vision: Groq (`GROQ_VISION_MODEL`, default `qwen/qwen3.8-27b`). Both wrapped behind `backend/llm.py` so the provider can change.
-- Speech out: `backend/tts.py` (the ONLY file that talks to AssemblyAI TTS).
+- Text LLM: Groq (`GROQ_TEXT_MODEL`, default `openai/gpt-oss-120b`). Vision: Groq (`GROQ_VISION_MODEL`, default `qwen/qwen3.8-27b`). Both wrapped behind `backend/llm.py` so the provider can change.
+- Speech out: `backend/tts.py` — AssemblyAI has no standalone TTS endpoint, so every line is spoken by opening one real Voice Agent session (wss://agents.assemblyai.com/v1/ws) whose `greeting` speaks exactly our text; see `ASSEMBLYAI_NOTES.md`.
 - Speech in: `backend/stt.py` — WebSocket proxy to AssemblyAI streaming v3 (`wss://streaming.assemblyai.com/v3/ws`, mono 16 kHz PCM16, key in the Authorization header **without** Bearer, never reaching the browser).
-- Decision engine: `backend/decider.py` — local heuristic `FallbackDecider`, or `JevDecider` (TypeSafe/Jev) with `USE_JEV=true`.
+- Decision engine: `backend/decider.py` — `FallbackDecider`, the local weighted heuristic that also models silence and the silent-mole gate.
 - Every external call appends one JSON line to `backend/api_log.jsonl` (see "API usage log" below).
 
 ## Build order (each module is independently runnable)
 
-llm → scene → characters → decider → engine (text-only) → tts → frontend → stt → jev.
+llm → scene → characters → decider → engine (text-only) → tts → frontend → stt.
 
 ## Setup (Windows 10)
 
@@ -69,12 +69,10 @@ The Vite dev server proxies `/api` and `/ws` to `http://localhost:8000`
 | var                     | needed for | default |
 |-------------------------|-----------|---------|
 | `GROQ_API_KEY`          | everything LLM (scene, characters, dialogue, scores) | — |
-| `GROQ_TEXT_MODEL`       | text model id | `llama-3.3-70b-versatile` |
+| `GROQ_TEXT_MODEL`       | text model id | `openai/gpt-oss-120b` |
 | `GROQ_VISION_MODEL`     | vision model id | `qwen/qwen3.8-27b` |
-| `ASSEMBLYAI_API_KEY`    | streaming STT + TTS | — |
-| `ASSEMBLYAI_TTS_URL`    | TTS endpoint | — (see "known gaps") |
-| `ASSEMBLYAI_TTS_VOICE_PARAM` | voice field name in the TTS request body | `voice_id` |
-| `USE_JEV` / `JEV_ENDPOINT` / `JEV_API_KEY` / `JEV_MIN_CONF` / `JEV_TIMEOUT_MS` | Jev decider | `false` / typesafe.ai / — / `0.5` / `800` |
+| `ASSEMBLYAI_API_KEY`    | streaming STT + TTS (Voice Agent sessions) | — |
+| `ASSEMBLYAI_TTS_URL`    | optional TTS endpoint override | `wss://agents.assemblyai.com/v1/ws` |
 | `TTS_DISABLED=1`        | run the engine text-only (used by the engine test) | off |
 
 A missing key ALWAYS surfaces as
@@ -91,38 +89,35 @@ python ..\scripts\test_tts.py                     :: 3 lines x 3 voices -> scrip
 cd backend && python -m uvicorn main:app --port 8000   :: needed for stt + engine tests
 python ..\scripts\test_stt.py myvoice16k.wav      :: streams a wav through the live STT relay
 python ..\scripts\test_decider.py                 :: offline heuristic scenario (no API calls)
-python ..\scripts\test_jev.py                     :: one real Jev choice + fallback check
 python ..\scripts\test_engine_text_only.py [photo] :: full engine loop, TTS off, 12 lines + reveal
 python apilog.py                                   :: one selftest line into backend\api_log.jsonl
 ```
 
 ## What you must fill in manually
 
-1. **`backend/tts.py` — the marked block `PASTE ASSEMBLYAI TTS SNIPPET HERE`.**
-   AssemblyAI does not yet publish a documented standalone text→audio HTTP endpoint,
-   so that one function is intentionally unimplemented. Paste the official snippet /
-   request shape from the AssemblyAI TTS docs, return `(audio_bytes, mime_type)`,
-   and set `_implemented = True` on `_call_assemblyai_tts`. Everything around it is
-   already there: keep-alive client, disk cache keyed by `sha1(text+voice)` in
-   `backend/.tts_cache/`, retry once on 5xx (raise `_Retryable5xx`), warm-up call at
-   startup, timing logs. Until then every TTS call raises a clear
-   `TTSNotConfigured` naming exactly what is missing — no fake audio, ever.
+1. **Pay attention to the billing model for TTS.** There is no standalone TTS
+   endpoint: `backend/tts.py` implements synthesize() by opening ONE Voice Agent
+   WebSocket session per line and speaking the line verbatim as the session's
+   `greeting` (voice via `session.output.voice`, audio captured as PCM16/24 kHz
+   from `reply.audio` events, session ended immediately with `session.end` so
+   the agent's LLM loop never runs). Billing is **$4.50/hour prorated per
+   second** from WebSocket open — every line is one full session — so the
+   session-open / time-to-first-audio / total times are logged per call in
+   `backend/api_log.jsonl` and `py scripts/test_tts.py` prints them. All
+   protocol details and the endpoint list are documented in
+   `ASSEMBLYAI_NOTES.md`.
 2. **`backend/voices.json`** — seeded with the English voice IDs documented today
    (`alba, anna, charles, eve, george, jane, jean, mary, michael, paul, vera`).
    Replace with the official per-service voice list from the TTS docs. If it has
    fewer entries than selected characters you get a clear error asking you to add
    voices or select fewer objects.
-3. **`JEV_API_KEY` + `USE_JEV=true`** to switch the speaker chooser over to Jev.
-   The request/response shapes in `decider.py` follow the TypeSafe docs
-   (POST `{state, model, questions:{next_speaker:{type:"choice",instructions,criteria}}}`
-   → `answers.next_speaker.{choice,probabilities,confidence}`); there is a marked
-   TODO(`JEV REQUEST SHAPE`) to re-verify against the current docs. Below
-   `JEV_MIN_CONF`, on error, or past `JEV_TIMEOUT_MS`, it falls back to the local
-   heuristic and reports why in the `jev` debug field.
 
 ## Known gaps / notes
 
-- **TTS via paste-block (above)** — while absent, lines play as captions with
+- **TTS = one Voice Agent session per line** — see `ASSEMBLYAI_NOTES.md` for the
+  billing model and how to read the per-line overhead out of `api_log.jsonl`; the
+  proto is gated by the disk cache (`sha1(text+voice)`), so a repeated line never
+  reopens a session. While no key is set, lines play as captions with
   `audio_url: null`; the engine still runs (test with `TTS_DISABLED=1`).
 - **No sessions DB** — scenes, characters, and audio caches live in process
   memory + disk cache; a backend restart drops the "same photo, different mode"
@@ -133,9 +128,11 @@ python apilog.py                                   :: one selftest line into bac
 - **Streaming STT chunk sizes** — AssemblyAI rejects audio frames shorter than
   50 ms or longer than 1 s; the frontend sends exact 50 ms 1600-byte frames and
   the backend clamps silently.
-- **Groq model drift** — `llama-3.3-70b-versatile` is scheduled for Groq
-  deprecation; `qwen/qwen3.8-27b` is the current vision pick. Both are env vars,
-  so add a mode/model without touching code.
+- **Groq model drift** — `llama-3.3-70b-versatile` was retired from Groq's
+  on-demand tier (verified live via the `/v1/models` list); the text default is
+  now `openai/gpt-oss-120b` and the vision default `qwen/qwen3.8-27b`. Both are
+  env vars (`GROQ_TEXT_MODEL` / `GROQ_VISION_MODEL`), so swap models without
+  touching code; `scripts/list_models.py` prints what your key can use.
 - **Anti-repetition & line caps** are enforced in-engine (Jaccard > 0.7 vs the
   last 8 lines triggers ONE regeneration; lines > 18 words / multi-sentence get
   truncated or re-asked, so final punctuation can occasionally be pragmatic).
@@ -156,10 +153,11 @@ backend/
   llm.py         chat(...) + vision(...): Groq wrapper, timing + apilog
   scene.py       POST /api/scene -> {scene_id, objects[{id,label,bbox,hint}]}, in-memory image store
   characters.py  ONE LLM call -> name/role/personality/habit/catchphrase/relationships + voices
-  decider.py     choose_speaker(state) -> Decision; FallbackDecider / JevDecider
+  decider.py     choose_speaker(state) -> Decision; FallbackDecider (the only implementation)
   engine.py      one asyncio task per session: turn loop, barge-in, cover stories,
                  reveal / scoring phases, 40-line & 10-min hard caps
-  tts.py         synthesize(text, voice_id) -> (bytes, mime); ONLY TTS entrypoint
+  tts.py         synthesize(text, voice_id, style) -> (bytes, mime, style_method); Voice Agent greeting session per line
+  tts_capabilities.json  language gate for the frontend voice-language selector (you fill in)
   stt.py         /ws/stt proxy to AssemblyAI streaming v3 (key stays server-side)
   apilog.py      one JSON line per external call -> backend/api_log.jsonl
   modes/*.json   mode definitions (cap, roles, tone, rules, ending)
@@ -168,6 +166,7 @@ backend/
 
 WebSocket protocol (`/ws/session`) — client sends
 `start{scene_id,mode,object_ids,difficulty}`, `user_speech_start`,
-`user_transcript{text,final}`, `played{line_id}`, `pause`, `resume`, `stop`,
-`done`; server sends `characters{...}`, `line{line_id,speaker_id,text,audio_url,caption_ms,debug}`,
+`user_transcript{text,final}`, `user_reaction{emoji,target_id?}`, `played{line_id}`,
+`revoice`, `language{code}`, `pause`, `resume`, `stop`, `done`; server sends
+`characters{...}`, `line{line_id,speaker_id,text,audio_url,caption_ms,mood,emoji,delivery,voice_id,style,debug}`,
 `silent{speaker_id,reason}`, `status`, `debug`, `ended{summary}`.

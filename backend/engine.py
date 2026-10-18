@@ -15,13 +15,21 @@ Rules implemented here (per product spec):
   - user_speech_start: cancel in-flight generation, drop queued lines,
     trigger the mode's interruption behaviour (conspiracy cover stories),
   - conspiracy ending: ~14 spoken lines or Stop -> the mole confesses,
-  - judges: pause-aware questions, Done or 3 min -> per-judge score + feedback.
+  - judges: pause-aware questions, Done or 3 min -> per-judge score + feedback,
+  - lines carry a mood tag -> a `delivery` (whisper|normal|shout|nervous|sarcastic|
+    slow|fast) and one whitelisted emoji (stripped from text before TTS),
+  - user_reaction -> a character responds in words + emoji,
+  - revoice -> replays the last played line with a DIFFERENT voice (replay:true,
+    never enters history),
+  - language -> regenerate lines in another language (only if the TTS API
+    supports it per backend/tts_capabilities.json).
 
 The client object only needs an async `send_json(dict)` (FastAPI WebSocket has
 one; scripts/test_engine_text_only.py collects into a list instead).
 """
 import asyncio
 import json
+import random
 import sys
 import time
 import uuid
@@ -41,6 +49,19 @@ JUDGE_REPLY_QUIET_S = 2.2
 COVER_DISPATCH_QUIET_S = 1.2
 RESUME_PLOTTING_QUIET_S = 6.0
 COVER_LINES_MAX = 2
+
+# reaction + line-face emoji whitelist (engine never invents others)
+EMOJI_WHITELIST = ["😈", "😏", "😳", "😱", "🤔", "😅", "🙄", "😴", "👀", "🔥", "💡", "🎤", "❓", "✅", "❌", "👏"]
+MOODS = ["whisper", "nervous", "smug", "angry", "calm", "excited", "sarcastic"]
+DELIVERY_BY_MOOD = {
+    "whisper": "whisper",
+    "nervous": "nervous",
+    "smug": "sarcastic",
+    "angry": "shout",
+    "calm": "slow",
+    "excited": "fast",
+    "sarcastic": "sarcastic",
+}
 
 MODES_DIR = backend_dir() / "modes"
 # in-memory audio registry: line_id -> (audio_bytes, mime_type)
@@ -64,6 +85,10 @@ def get_audio(line_id: str) -> tuple[bytes, str] | None:
 
 def _words(s: str) -> list[str]:
     return [w for w in s.split() if w]
+
+
+def _strip_whitelist_emoji(text: str) -> str:
+    return "".join(ch for ch in text if ch not in EMOJI_WHITELIST)
 
 
 def _clean_text(text: str) -> str:
@@ -115,6 +140,10 @@ class EngineSession:
         self.user_is_speaking = False
         self.user_last_final_at: float | None = None
         self.cover_lines_left = 0
+        self.language: str | None = None            # set by {type:'language'} if TTS supports it
+        self.reaction_context: dict[str, Any] | None = None
+        self.last_played_meta: dict[str, Any] | None = None
+        self.last_gen_error_at: float | None = None  # backoff after a failed generation
         self.tasks: list[asyncio.Task] = []
         self.relationships: list[dict[str, Any]] = []
         # ---- metrics
@@ -208,6 +237,12 @@ class EngineSession:
                 self._on_user_transcript(data)
             elif etype == "played":
                 self._on_played(data)
+            elif etype == "user_reaction":
+                await self._on_user_reaction(data)
+            elif etype == "revoice":
+                await self._on_revoice()
+            elif etype == "language":
+                await self._on_language(data)
             elif etype == "pause":
                 self.paused = True
                 await self.send({"type": "status", "status": "paused"})
@@ -245,6 +280,7 @@ class EngineSession:
         self.user_presentation.append(text)
         self.last_user_text = text
         self.last_event = {"source": "user", "text": text}
+        self.reaction_context = None  # words beat a pending emoji reaction
         # directly addressing a start_silent character triggers them
         for c in self.characters:
             if c.get("starts_silent") and not c.get("triggered"):
@@ -257,6 +293,11 @@ class EngineSession:
             return
         self.pending = None
         self.played.append({"speaker_id": line["speaker_id"], "text": line["text"]})
+        self.last_played_meta = {
+            "speaker_id": line["speaker_id"],
+            "text": line["text"],
+            "delivery": line.get("delivery"),
+        }
         self.history_version += 1
         self.spoken_count += 1
         self.turn += 1
@@ -274,6 +315,115 @@ class EngineSession:
             self.pending = staged
             asyncio.get_event_loop().create_task(self.send(staged))
             self._schedule_prefetch()
+
+    # ------------------------------------------------------------------ reaction / revoice / language
+    async def _on_user_reaction(self, data: dict[str, Any]) -> None:
+        emoji = str(data.get("emoji") or "").strip()
+        if emoji not in EMOJI_WHITELIST:
+            await self.send(
+                {
+                    "type": "error",
+                    "code": "reaction",
+                    "message": f"Emoji not in the reaction whitelist: {emoji!r}",
+                }
+            )
+            return
+        raw_target = data.get("target_id")
+        target = self._char_by_id(str(raw_target)) if raw_target else None
+        if target:
+            target["triggered"] = True  # directly reacting AT a silent character unlocks them
+        self.last_user_text = ""  # a reaction carries no words
+        self.last_event = {"source": "user", "text": "", "reaction": emoji}
+        self.user_last_final_at = time.time()
+        if self.phase in ("normal", "cover"):
+            self.reaction_context = {
+                "emoji": emoji,
+                "target_id": target["object_id"] if target else None,
+            }
+        await self.send({"type": "status", "status": f"reacted {emoji}"})
+
+    async def _on_language(self, data: dict[str, Any]) -> None:
+        caps = tts.load_capabilities()
+        code = str(data.get("code") or "")
+        if code and caps.get("languages_supported") and code in caps.get("languages", []):
+            self.language = code
+            await self.send({"type": "status", "status": f"language: {code}"})
+        else:
+            await self.send(
+                {
+                    "type": "error",
+                    "code": "language",
+                    "message": (
+                        f"Language {code!r} is not supported by the TTS API. "
+                        "Set languages_supported + languages in backend/tts_capabilities.json first."
+                    ),
+                }
+            )
+
+    async def _on_revoice(self) -> None:
+        """Replay the last played line through a DIFFERENT voice (replay:true;
+        never enters played history and the client does not ack it back)."""
+        meta = self.last_played_meta
+        char = self._char_by_id(meta["speaker_id"]) if meta else None
+        if not meta or char is None or not char.get("voice_id"):
+            await self.send(
+                {
+                    "type": "error",
+                    "code": "revoice",
+                    "message": "Nothing has played yet, so there is no last line to re-voice.",
+                }
+            )
+            return
+        others = [v for v in characters_mod.load_voices() if v != char["voice_id"]]
+        if not others:
+            await self.send(
+                {
+                    "type": "error",
+                    "code": "revoice",
+                    "message": "voices.json has only one voice, so there is nothing else to re-voice with.",
+                }
+            )
+            return
+        new_voice = random.choice(others)
+        t0 = time.perf_counter()
+        try:
+            audio, mime, style_method = await tts.synthesize(
+                meta["text"], new_voice, {"delivery": meta.get("delivery"), "language": self.language}
+            )
+        except tts.TTSNotConfigured as exc:
+            await self.send({"type": "error", "code": "revoice", "message": str(exc)})
+            return
+        except Exception as exc:  # noqa: BLE001
+            await self.send({"type": "error", "code": "revoice", "message": str(exc)})
+            return
+        self.line_counter += 1
+        line_id = f"rv{self.line_counter}"
+        _AUDIO[line_id] = (audio, mime)
+        await self.send(
+            {
+                "type": "line",
+                "line_id": line_id,
+                "speaker_id": char["object_id"],
+                "speaker_name": char["name"],
+                "text": meta["text"],
+                "audio_url": f"/api/audio/{line_id}",
+                "caption_ms": max(1500, len(_words(meta["text"])) * 260 + 400),
+                "replay": True,
+                "revoice_from": char["voice_id"],
+                "voice_id": new_voice,
+                "emoji": None,
+                "mood": None,
+                "delivery": meta.get("delivery"),
+                "style": {"delivery": meta.get("delivery"), "method": style_method},
+                "debug": {
+                    "llm_ms": 0.0,
+                    "tts_ms": round((time.perf_counter() - t0) * 1000, 1),
+                    "decider": {"chosen": char["object_id"], "scores": {}, "reason": "re-voice"},
+                    "style": {"delivery": meta.get("delivery"), "method": style_method},
+                },
+                "tts_error": None,
+            }
+        )
 
     def _engine_state(self) -> dict[str, Any]:
         return {
@@ -322,8 +472,32 @@ class EngineSession:
         """
         if self.pending is not None or (self.gen_task and not self.gen_task.done()):
             return
+        # after a failed generation (e.g. provider 429) back off before retrying,
+        # so a dead provider can never be hammered once per 300 ms tick
+        if self.last_gen_error_at is not None and time.time() - self.last_gen_error_at < 5.0:
+            return
         mode_id = (self.mode or {}).get("id")
         quiet_for = time.time() - self.user_last_final_at if self.user_last_final_at is not None else None
+
+        if (
+            self.reaction_context
+            and not self.user_is_speaking
+            and self.phase in ("normal", "cover")
+        ):
+            rc, self.reaction_context = self.reaction_context, None
+            target = self._char_by_id(rc["target_id"]) if rc.get("target_id") else None
+            if target:
+                hint = (
+                    f'The user just reacted with {rc["emoji"]} AT {target["name"]}. '
+                    f'{target["name"]} answers the reaction in ONE short line (words + emoji face).'
+                )
+            else:
+                hint = (
+                    f'The user just reacted with the {rc["emoji"]} emoji (no words). '
+                    f'Whoever fits best comments on that reaction in ONE short line (words + emoji face).'
+                )
+            self.gen_task = asyncio.create_task(self._produce_and_send(rc.get("target_id"), hint))
+            return
 
         if mode_id == "judges" and self.phase == "normal":
             # judges wait for an end-of-turn pause, then ONE pointed question
@@ -378,6 +552,7 @@ class EngineSession:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                self.last_gen_error_at = time.time()
                 await self.send({"type": "error", "code": "generation", "message": str(exc)})
                 return
             if line is None:
@@ -395,13 +570,17 @@ class EngineSession:
         t0 = time.perf_counter()
         speaker_id = forced_speaker
         silent_id: str | None = None
-        jev_debug: dict[str, Any] = {"probs": None, "confidence": None, "used": True}
+        sel_debug: dict[str, Any] = {"chosen": speaker_id, "scores": {}, "reason": "forced"}
         if speaker_id is None:
             dec = self.decider.choose_speaker(self._engine_state())
             if asyncio.iscoroutine(dec):
                 dec = await dec
             self.decide_ms = (time.perf_counter() - t0) * 1000
-            jev_debug = (dec.debug or {}).get("jev", jev_debug)
+            sel_debug = {
+                "chosen": dec.speaker_id,
+                "scores": (dec.debug or {}).get("breakdown", {}),
+                "reason": dec.reason,
+            }
             silent_id = (dec.debug or {}).get("silent_id")
             speaker_id = dec.speaker_id
             if speaker_id is None:
@@ -423,12 +602,13 @@ class EngineSession:
         prompt_msgs = self._build_prompt(speaker, context_hint, max_words)
         t_llm = time.perf_counter()
         self.llm_calls += 1
-        text_raw = await llm.chat(prompt_msgs, max_tokens=90, temperature=0.9)
+        obj = await self._generate_line_obj(prompt_msgs, temperature=0.9)
         llm_ms = (time.perf_counter() - t_llm) * 1000
-        line = self._sanitize_line(text_raw, speaker, max_words)
+        mood, emoji = self._pick_mood_emoji(obj)
+        line = self._sanitize_line(str(obj.get("text") or ""), speaker, max_words)
         if _too_similar(line, self.played):
             self.llm_calls += 1  # ONE regeneration against repetition
-            retry = await llm.chat(
+            retry_obj = await self._generate_line_obj(
                 prompt_msgs
                 + [
                     {
@@ -436,12 +616,12 @@ class EngineSession:
                         "content": "Different wording, same intent. Nothing like the previous lines.",
                     }
                 ],
-                max_tokens=90,
                 temperature=1.0,
             )
-            alt = self._sanitize_line(retry, speaker, max_words)
+            alt = self._sanitize_line(str(retry_obj.get("text") or ""), speaker, max_words)
             if not _too_similar(alt, self.played):
                 line = alt
+                mood, emoji = self._pick_mood_emoji(retry_obj)
 
         if snapshot != self.history_version:
             raise _Stale()  # went stale: discarded, never played, never in history
@@ -453,14 +633,20 @@ class EngineSession:
         audio_url: str | None = None
         tts_error: str | None = None
         self.tts_calls += 1
+        delivery = DELIVERY_BY_MOOD.get(mood, "normal")
         try:
-            audio, mime = await tts.synthesize(line, speaker["voice_id"])
+            audio, mime, style_method = await tts.synthesize(
+                line,
+                speaker["voice_id"],
+                {"delivery": delivery, "language": self.language},
+            )
             _AUDIO[line_id] = (audio, mime)
             audio_url = f"/api/audio/{line_id}"
             if self.first_audio_ms is None:
                 self.first_audio_ms = (time.perf_counter() - self.started_at) * 1000
         except tts.TTSNotConfigured as exc:
             tts_error = str(exc)
+            style_method = "none"
         tts_ms = (time.perf_counter() - t_tts) * 1000
 
         return {
@@ -472,6 +658,11 @@ class EngineSession:
             "audio_url": audio_url,
             "caption_ms": max(1500, len(_words(line)) * 260 + 400),
             "snapshot": snapshot,
+            "mood": mood,
+            "emoji": emoji,
+            "delivery": delivery,
+            "voice_id": speaker["voice_id"],
+            "style": {"delivery": delivery, "method": style_method},
             "debug": {
                 "decide_ms": round(self.decide_ms, 1),
                 "llm_ms": round(llm_ms, 1),
@@ -479,13 +670,39 @@ class EngineSession:
                 "first_audio_ms": round(self.first_audio_ms or 0.0, 1),
                 "llm_calls": self.llm_calls,
                 "tts_calls": self.tts_calls,
-                "jev": jev_debug,
+                "decider": sel_debug,
+                "style": {"delivery": delivery, "method": style_method},
             },
             "tts_error": tts_error,
         }
 
+    async def _generate_line_obj(
+        self, prompt_msgs: list[dict[str, str]], temperature: float
+    ) -> dict[str, Any]:
+        """ONE LLM call -> {"text", "mood", "emoji"} (tolerant parse)."""
+        text_raw = await llm.chat(
+            prompt_msgs,
+            max_tokens=140,
+            temperature=temperature,
+            response_format={"type": "json_object"},
+        )
+        try:
+            obj = llm._parse_json(text_raw)
+        except Exception:  # noqa: BLE001 - prose fallback: use the raw line text
+            obj = {"text": text_raw}
+        if not isinstance(obj, dict):
+            obj = {"text": text_raw}
+        return obj
+
+    def _pick_mood_emoji(self, obj: dict[str, Any]) -> tuple[str, str | None]:
+        mood = str(obj.get("mood") or "").strip().lower()
+        if mood not in MOODS:
+            mood = "calm"
+        emoji = obj.get("emoji")
+        return mood, (emoji if isinstance(emoji, str) and emoji in EMOJI_WHITELIST else None)
+
     def _sanitize_line(self, raw: str, speaker: dict[str, Any], max_words: int) -> str:
-        t = _clean_text(raw)
+        t = _clean_text(_strip_whitelist_emoji(raw))
         toks = _words(t)
         if len(toks) > max_words:
             first = t.split(". ")[0].rstrip(",;:")
@@ -496,7 +713,11 @@ class EngineSession:
         return t[0].upper() + t[1:]
 
     def _build_prompt(
-        self, speaker: dict[str, Any], context_hint: str | None, max_words: int
+        self,
+        speaker: dict[str, Any],
+        context_hint: str | None,
+        max_words: int,
+        require_json: bool = True,
     ) -> list[dict[str, str]]:
         mode = self.mode or {}
         system = (
@@ -521,9 +742,21 @@ class EngineSession:
             f"Recent spoken lines (you only know what was actually played):\n{history or '(nothing spoken yet)'}\n"
             f"User's last words: \"{self.last_user_text or '(they have said nothing yet)'}\"\n"
             f"Hard format rules: at most {max_words} words, ONE sentence, must react to the previous line. "
-            "No stage directions, no emojis, no quotes around speech, no narration, no parentheses. "
+            "No stage directions, no emojis in the text itself, no quotes around speech, no narration, no parentheses. "
             "Speak plain English unless the user clearly speaks another language."
         )
+        if require_json:
+            user_ctx += (
+                "\n\nThen pick: your mood this line, one of [whisper, nervous, smug, angry, calm, excited, sarcastic], "
+                "and ONE face emoji that matches it, from this list only: "
+                + " ".join(EMOJI_WHITELIST)
+                + '.\nReply ONLY with JSON: {"text": "<your line>", "mood": "<mood>", "emoji": "<one emoji>"}'
+            )
+        if self.language:
+            user_ctx += (
+                f"\nSpeak the conversation in the language whose ISO code is '{self.language}' "
+                "unless the user clearly speaks another language."
+            )
         if context_hint:
             user_ctx += f"\nNow: {context_hint}"
         if self.phase == "cover":
@@ -568,6 +801,7 @@ class EngineSession:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001
+                    self.last_gen_error_at = time.time()
                     await self.send({"type": "error", "code": "prefetch", "message": str(exc)})
                     return
                 if line is None or self.pending is not None or self.ended:
@@ -636,7 +870,9 @@ class EngineSession:
         prefix = {"score": "s", "reveal": "r"}[phase]
         try:
             text_raw = await llm.chat(
-                self._build_prompt(speaker, extra_hint, max_words), max_tokens=100, temperature=1.0
+                self._build_prompt(speaker, extra_hint, max_words, require_json=False),
+                max_tokens=100,
+                temperature=1.0,
             )
             self.llm_calls += 1
         except Exception as exc:  # noqa: BLE001
@@ -648,8 +884,11 @@ class EngineSession:
         audio_url: str | None = None
         tts_error: str | None = None
         self.tts_calls += 1
+        style_method = "none"
         try:
-            audio, mime = await tts.synthesize(text, speaker["voice_id"])
+            audio, mime, style_method = await tts.synthesize(
+                text, speaker["voice_id"], {"language": self.language}
+            )
             _AUDIO[line_id] = (audio, mime)
             audio_url = f"/api/audio/{line_id}"
         except tts.TTSNotConfigured as exc:
@@ -662,6 +901,11 @@ class EngineSession:
             "text": text,
             "audio_url": audio_url,
             "caption_ms": max(2200, len(_words(text)) * 280 + 600),
+            "mood": None,
+            "emoji": None,
+            "delivery": None,
+            "voice_id": speaker["voice_id"],
+            "style": {"delivery": None, "method": style_method},
             "debug": {
                 "decide_ms": 0.0,
                 "llm_ms": 0.0,
@@ -669,7 +913,8 @@ class EngineSession:
                 "first_audio_ms": round(self.first_audio_ms or 0.0, 1),
                 "llm_calls": self.llm_calls,
                 "tts_calls": self.tts_calls,
-                "jev": {},
+                "decider": {"chosen": speaker["object_id"], "scores": {}, "reason": f"forced ({phase})"},
+                "style": {"delivery": None, "method": style_method},
             },
             "tts_error": tts_error,
         }
@@ -684,6 +929,11 @@ class EngineSession:
             self.pending = None
             self.spoken_count += 1
             self.played.append({"speaker_id": line["speaker_id"], "text": line["text"]})
+            self.last_played_meta = {
+                "speaker_id": line["speaker_id"],
+                "text": line["text"],
+                "delivery": line.get("delivery"),
+            }
 
     async def _finish_if_needed(self, timeout: bool = False) -> None:
         if self.ended:

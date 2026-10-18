@@ -41,6 +41,7 @@ def load_voices() -> list[str]:
 
 def assign_voices(count: int) -> list[str]:
     """Distinct shuffled voices; fails clearly when there are too few."""
+    global _LEN_CACHE
     if _LEN_CACHE and _LEN_CACHE[0] > time.time() - 5.0:
         n = _LEN_CACHE[1]
     else:

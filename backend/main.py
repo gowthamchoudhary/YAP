@@ -61,6 +61,11 @@ async def modes() -> list[dict[str, Any]]:
     return engine.load_modes()
 
 
+@app.get("/api/tts_capabilities")
+async def tts_capabilities() -> dict[str, Any]:
+    return dict(tts.load_capabilities())
+
+
 @app.get("/api/audio/{line_id}")
 async def audio(line_id: str) -> Response:
     item = engine.get_audio(line_id)

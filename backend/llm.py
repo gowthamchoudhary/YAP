@@ -9,8 +9,10 @@ Both functions:
   - log timing + errors through apilog,
   - raise config.MissingEnvError naming the missing env var when a key is absent.
 """
+import asyncio
 import base64
 import json
+import re
 import sys
 import time
 from typing import Any
@@ -18,7 +20,7 @@ from typing import Any
 import httpx
 
 import apilog
-from config import get, require
+from config import get, get_int, require
 
 PROVIDER = "groq"
 BASE_URL = (get("GROQ_BASE_URL", "https://api.groq.com/openai/v1") or "").rstrip("/")
@@ -42,18 +44,43 @@ def _check_key() -> str:
     )
 
 
+_RETRY_IN_RE = re.compile(r"try again in ([\d.]+)\s*(ms|s)", re.IGNORECASE)
+
+
+def _suggested_backoff_s(err_text: str) -> float:
+    m = _RETRY_IN_RE.search(err_text or "")
+    if not m:
+        return 2.0
+    delay = float(m.group(1))
+    return min(delay / 1000.0 if m.group(2).lower() == "ms" else delay, 15.0)
+
+
 async def _post(payload: dict[str, Any], service: str) -> dict[str, Any]:
-    """POST to chat completions with timing + apilog. Raises on any error."""
+    """POST to chat completions with timing + apilog. Raises on any error.
+
+    On a 429 the server-suggested 'try again in <delay>' is honoured with ONE
+    patient retry so the provider is never hammered.
+    """
     key = _check_key()
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     body = json.dumps(payload).encode("utf-8")
     t0 = time.perf_counter()
     status, err, status_code = "ok", None, None
     try:
-        resp = await _get_client().post(
-            f"{BASE_URL}/chat/completions", headers=headers, content=body
-        )
-        status_code = resp.status_code
+        for attempt in (1, 2):
+            resp = await _get_client().post(
+                f"{BASE_URL}/chat/completions", headers=headers, content=body
+            )
+            status_code = resp.status_code
+            if resp.status_code == 429 and attempt == 1:
+                delay = _suggested_backoff_s(resp.text)
+                print(
+                    f"[llm] 429 rate limited; waiting {delay:.2f}s before the one retry",
+                    file=sys.stderr,
+                )
+                await asyncio.sleep(delay)
+                continue
+            break
         if resp.status_code == 401:
             raise RuntimeError(
                 "Groq rejected the API key (401). Check GROQ_API_KEY in backend/.env."
@@ -93,17 +120,47 @@ async def chat(
     model: str | None = None,
     response_format: dict[str, Any] | None = None,
 ) -> str:
-    """One chat completion. Returns assistant text (documented current provider: Groq)."""
-    model = model or get("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile")
+    """One chat completion. Returns assistant text (documented current provider: Groq).
+
+    `messages` entries may be full {"role", "content"} dicts or bare prompt
+    strings; strings are normalized to user messages here so callers stay simple
+    and Groq always receives objects with the 'role' discriminator.
+    """
+    model = model or get("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
+    normalized = [
+        m if isinstance(m, dict) else {"role": "user", "content": str(m)} for m in messages
+    ]
     payload: dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": normalized,
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
     if response_format:
         payload["response_format"] = response_format
-    data = await _post(payload, service=f"groq.text[{model}]")
+    # gpt-oss (reasoning-channel models) reliably fail Groq's strict json_object
+    # mode for our prompts with 400 json_validate_failed; the prompt already
+    # demands JSON and _parse_json is lenient, so skip the response_format for
+    # those models instead of paying a 400 + full second call per line.
+    if response_format and "gpt-oss" in model:
+        payload.pop("response_format", None)
+    if "gpt-oss" in model:
+        # gpt-oss reasoning tokens count against max_tokens, so with the default
+        # 'medium' effort the visible JSON/line truncates mid-string. 'low' is the
+        # documented Groq knob for conversational gpt-oss workloads.
+        payload["reasoning_effort"] = get("GROQ_REASONING_EFFORT", "low")
+    try:
+        data = await _post(payload, service=f"groq.text[{model}]")
+    except RuntimeError as exc:
+        # gpt-oss occasionally returns 400 json_validate_failed with an empty
+        # failed_generation. The provider wrapper retries ONCE without the JSON
+        # mode — every prompt still demands JSON and _parse_json is lenient —
+        # so a single bad sampling can never kill a session.
+        if "json_validate_failed" not in str(exc):
+            raise
+        print("[llm] json_validate_failed (no reply sampled); retrying without json mode", file=sys.stderr)
+        payload.pop("response_format", None)
+        data = await _post(payload, service=f"groq.text[{model}] (no-json retry)")
     try:
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
@@ -129,7 +186,9 @@ async def vision(image_bytes: bytes, prompt: str, mime: str = "image/jpeg") -> d
                 ],
             }
         ],
-        "max_tokens": 1200,
+        # 900: the 12-object scene JSON needs only a few hundred tokens, and Groq's
+        # on-demand tier enforces a 1000 output-token-per-minute budget for this model
+        "max_tokens": get_int("GROQ_VISION_MAX_TOKENS", 900),
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
     }

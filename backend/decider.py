@@ -1,26 +1,18 @@
 """Who speaks next?
 
-Two implementations behind one interface (`choose_speaker(state) -> Decision`):
+One interface (`choose_speaker(state) -> Decision`), one implementation:
 
 - FallbackDecider: pure-local weighted heuristic. Addressed-name mentions win,
   role fit, connection to the last line, novelty, recent-speech penalty, jitter.
-- JevDecider (USE_JEV=true): sends ONE small atomic choice question ("which
-  candidate speaks next, or none") to Jev (TypeSafe / System One). If the
-  confidence is below JEV_MIN_CONF, the call fails, or it exceeds
-  JEV_TIMEOUT_MS, it falls back to FallbackDecider and reports why in debug.
+  Silence is allowed (returns speaker_id None); below the score threshold nobody
+  jumps in, and a directly-addressed start_silent character fires a `silent`
+  beat instead of a line.
 
 `state` is documented at _normalize_state below (built by engine.py).
 """
 import random
-import sys
-import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-
-import httpx
-
-import apilog
-from config import get, get_bool, get_float, get_int, require
 
 # Weights (FallbackDecider)
 W_ADDRESSED = 2.2       # user said this character's name/label/role
@@ -186,134 +178,7 @@ class FallbackDecider:
         )
 
 
-class JevDecider:
-    """One small atomic choice question to Jev; falls back to FallbackDecider
-    on low confidence, error, or JEV_TIMEOUT_MS overrun."""
-
-    def __init__(self) -> None:
-        self.fallback = FallbackDecider()
-        self.endpoint = get("JEV_ENDPOINT", "https://api.typesafe.ai/v1/systemone") or ""
-        self.min_conf = get_float("JEV_MIN_CONF", 0.5)
-        self.timeout_ms = get_int("JEV_TIMEOUT_MS", 800)
-        self.model = get("JEV_MODEL", "jev-latest") or "jev-latest"
-
-    # ---------------------------------------------------------------- state → text
-    def _state_text(self, s: dict[str, Any]) -> str:
-        lines = []
-        for c in s["characters"]:
-            mute = (
-                " (STARTS SILENT, not yet addressed by the user)"
-                if c.get("starts_silent") and not c.get("triggered")
-                else ""
-            )
-            lines.append(f"{c['object_id']} = {c['name']} the {c['role']}{mute}")
-        played_tail = "; ".join(f"{p['speaker_id']}: \"{p['text'][:70]}\"" for p in s["played"][-2:])
-        return (
-            f"mode={s['mode_id']} phase={s['phase']} difficulty={s['difficulty']} turn={s['turn_index']}\n"
-            f"candidates:\n{chr(10).join(lines)}\n"
-            f"last lines: {played_tail or '(none)'}\n"
-            f"user just said: \"{(s['last_user_text'] or '')[:120]}\"\n"
-            "Pick which candidate should speak the next line, or 'none' if nobody should."
-        )
-
-    async def choose_speaker(self, state: dict[str, Any]) -> Decision:
-        s = _normalize_state(state)
-        candidates = [
-            c["object_id"]
-            for c in s["characters"]
-            if not (c.get("starts_silent") and not c.get("triggered") and s["phase"] != "reveal")
-        ]
-        if not candidates:
-            return self.fallback.choose_speaker(state)
-
-        # TODO(JEV REQUEST SHAPE): verify against the CURRENT Jev (TypeSafe) docs
-        # at https://docs.typesafe.ai/api before demo day; adjust payload/response
-        # parsing below only from the docs, never by inventing fields.
-        # Documented shape (checked 2026-10):
-        #   POST {state, model, questions:{qid:{type:"choice",instructions,criteria}}}
-        #   -> answers.qid.{choice, probabilities (per option), confidence}
-        criteria = {
-            c["object_id"]: f"{c['name']} the {c['role']} — {(c.get('personality') or '')[:60]}"
-            for c in s["characters"]
-            if c["object_id"] in candidates
-        }
-        criteria["none"] = "Nobody should speak right now"
-        payload = {
-            "state": self._state_text(s),
-            "model": self.model,
-            "questions": {
-                "next_speaker": {
-                    "type": "choice",
-                    "instructions": "Which candidate should speak the next line of this cartoon conversation? Choose 'none' if nobody should speak.",
-                    "criteria": criteria,
-                }
-            },
-        }
-        t0 = time.perf_counter()
-        err, status, status_code = None, "ok", None
-        jev_debug: dict[str, Any]
-        try:
-            key = require(
-                "JEV_API_KEY",
-                "Jev (TypeSafe) key — set JEV_API_KEY in backend/.env, or set USE_JEV=false",
-            )
-            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-            async with httpx.AsyncClient(timeout=self.timeout_ms / 1000) as client:
-                resp = await client.post(self.endpoint, json=payload, headers=headers)
-            status_code = resp.status_code
-            resp.raise_for_status()
-            data = resp.json()
-            ans = (data.get("answers") or {}).get("next_speaker") or {}
-            choice = ans.get("choice")
-            probs = ans.get("probabilities") or {}
-            conf = float(ans.get("confidence", 0.0))
-            latency = (time.perf_counter() - t0) * 1000
-
-            if choice not in candidates:
-                jev_debug = {"probs": probs, "confidence": conf, "used": False,
-                             "fallback_reason": f"invalid choice '{choice}'"}
-            elif conf < self.min_conf:
-                jev_debug = {"probs": probs, "confidence": conf, "used": False,
-                             "fallback_reason": f"confidence {conf:.2f} < JEV_MIN_CONF {self.min_conf}"}
-            else:
-                return Decision(
-                    choice,
-                    f"Jev choice '{choice}' conf={conf:.2f} ({latency:.0f}ms)",
-                    {"jev": {"probs": probs, "confidence": conf, "used": True}},
-                )
-        except Exception as exc:  # noqa: BLE001 - every failure falls back
-            err = f"{type(exc).__name__}: {exc}"
-            status = "error"
-            latency = (time.perf_counter() - t0) * 1000
-            jev_debug = {
-                "probs": None, "confidence": None, "used": False,
-                "fallback_reason": err[:220],
-            }
-        finally:
-            apilog.log_call(
-                service="jev",
-                endpoint=str(self.endpoint),
-                status=status,
-                latency_ms=(time.perf_counter() - t0) * 1000,
-                error=err,
-                status_code=status_code,
-            )
-            print(
-                f"[jev] latency={(time.perf_counter() - t0) * 1000:.0f}ms status={status}"
-                f"{' err=' + err if err else ''}",
-                file=sys.stderr,
-            )
-
-        # ---- fallback path (Jev unavailable, low confidence, or bad answer)
-        fb = self.fallback.choose_speaker(state)
-        fb.debug["jev"] = jev_debug
-        fb.reason = fb.reason + f" [Jev fallback: {jev_debug.get('fallback_reason', '?')}]"
-        return fb
-
-
 def make_decider() -> Decider:
-    if get_bool("USE_JEV", False):
-        return JevDecider()
     return FallbackDecider()
 
 
