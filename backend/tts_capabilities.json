@@ -1,0 +1,6 @@
+{
+  "_readme": "Fill in what your AssemblyAI TTS HTTP API ACTUALLY supports (fields below). Empty/null means 'not supported by the API' - tts.py then falls back to text-level shaping only (punctuation/pauses) and reports style_method 'text'. Never invent values for params the API does not document.",
+  "deliveries": {},
+  "languages_supported": false,
+  "languages": []
+}
