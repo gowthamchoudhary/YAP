@@ -8,6 +8,10 @@ export default defineConfig({
   plugins: [react()],
   server: {
     host: true,
+    // Managed Freebuff preview serves the dev server through the
+    // *.e2b.app tunnel host, which Vite blocks by default (CVE-2025-30208-style
+    // host-header protection). Allow the preview host explicitly.
+    allowedHosts: ["5173-ivyjzh3od97cccdlb7opb.e2b.app"],
     proxy: {
       "/api": {
         target: process.env.BACKEND_URL || "http://localhost:8000",

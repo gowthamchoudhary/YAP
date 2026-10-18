@@ -1,36 +1,40 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createScene } from "../lib/api.js";
 
-export default function CaptureScreen({ onImageReady }) {
+export default function CaptureScreen({ onImageReady, onBack }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [ready, setReady] = useState(false);
+  const [facing, setFacing] = useState("environment");
 
   const stopStream = useCallback(() => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
   }, []);
 
-  const openCamera = useCallback(async () => {
-    setError("");
-    try {
-      stopStream();
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
-        audio: false,
-      });
-      streamRef.current = stream;
-      videoRef.current.srcObject = stream;
-      await videoRef.current.play();
-      setReady(true);
-    } catch (e) {
-      setReady(false);
-      setError(`Camera unavailable (${e.name}). Upload a photo instead.`);
-    }
-  }, [stopStream]);
+  const openCamera = useCallback(
+    async (facingMode = facing) => {
+      setError("");
+      try {
+        stopStream();
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        });
+        streamRef.current = stream;
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+        setReady(true);
+      } catch (e) {
+        setReady(false);
+        setError("Camera unavailable. Upload a photo instead.");
+      }
+    },
+    [facing, stopStream]
+  );
 
   useEffect(() => {
     openCamera();
@@ -53,7 +57,7 @@ export default function CaptureScreen({ onImageReady }) {
     } catch (e) {
       setError(String(e.message || e));
       setBusy(false);
-      openCamera(); // keep streaming around while the user retries
+      openCamera();
     }
   }, [onImageReady, openCamera, stopStream]);
 
@@ -75,37 +79,81 @@ export default function CaptureScreen({ onImageReady }) {
   );
 
   return (
-    <section className="screen capture">
-      <h1>
-        <span className="logo-glow">YAP</span> — bring a room to life
-      </h1>
-      <p className="lede">
-        Photograph a place. Pick what you can see. The objects start talking — and in the
-        Conspiracy mode, they keep a secret about <em>you</em>.
-      </p>
+    <div className="capture">
+      <button className="back-btn" onClick={onBack} aria-label="Back to home">
+        ←
+      </button>
+
       <div className="camera-frame">
-        <video ref={videoRef} playsInline muted className="preview" />
+        <video ref={videoRef} playsInline muted className="camera-video" />
         <canvas ref={canvasRef} className="hidden" />
-        {!ready && <div className="camera-fallback">camera loading…</div>}
+        {!ready && !busy && <div className="camera-fallback">camera loading…</div>}
+
+        {/* viewfinder corner brackets */}
+        <span className="vf-corner vf-tl" aria-hidden />
+        <span className="vf-corner vf-tr" aria-hidden />
+        <span className="vf-corner vf-bl" aria-hidden />
+        <span className="vf-corner vf-br" aria-hidden />
+
+        <p className="vf-hint scribble-script">
+          Point your camera <br /> at a scene <span className="vf-arrow">→</span>
+        </p>
+
+        {!busy && (
+          <div className="camera-toolbar">
+            <span className="mode-pill active">PHOTO</span>
+            <span className="mode-pill">VIDEO</span>
+            <span className="mode-pill">IMPORT</span>
+          </div>
+        )}
       </div>
-      <div className="row">
-        <button className="btn primary" onClick={capture} disabled={!ready || busy}>
-          {busy ? "Reading the room…" : "Capture"}
-        </button>
-        <label className="btn">
-          Upload instead
+
+      {/* shutter row */}
+      <div className="shutter-row">
+        <label className="gallery-btn">
           <input
             type="file"
             accept="image/*"
             className="visually-hidden"
             onChange={(e) => upload(e.target.files?.[0])}
           />
+          <span role="img" aria-label="Upload a photo">🖼</span>
         </label>
-        <button className="btn ghost" onClick={openCamera} disabled={busy}>
-          Flip camera
+        <button
+          className="shutter"
+          onClick={capture}
+          disabled={!ready || busy}
+          aria-label="Capture photo"
+        />
+        <button
+          className="flip-btn"
+          onClick={() => {
+            const next = facing === "environment" ? "user" : "environment";
+            setFacing(next);
+            openCamera(next);
+          }}
+          disabled={busy}
+          aria-label="Flip camera"
+        >
+          ↻
         </button>
       </div>
+
+      {/* "Finding objects" overlay */}
+      {busy && (
+        <div className="finding-overlay">
+          <div className="finding-blob" aria-hidden>👀</div>
+          <div className="finding-card">
+            <strong>Finding objects…</strong>
+            <div className="finding-bar">
+              <div className="finding-bar-fill" />
+            </div>
+            <span className="dim">Detecting objects in your scene</span>
+          </div>
+        </div>
+      )}
+
       {error && <p className="error" role="alert">{error}</p>}
-    </section>
+    </div>
   );
 }

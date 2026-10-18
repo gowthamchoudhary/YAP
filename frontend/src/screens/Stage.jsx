@@ -24,10 +24,12 @@ export default function StageScreen({
   modeName,
   difficulty,
   selected,
+  characterEdits, // {object_id: {name, traits, voice_id}} from the Setup screen
   onChangeMode,
   onRetake,
   onDebug,
   onEnded,
+  onBackHome,
 }) {
   const [characters, setCharacters] = useState([]);
   const [captions, setCaptions] = useState([]);
@@ -161,6 +163,9 @@ export default function StageScreen({
         mode: modeId,
         object_ids: selected,
         difficulty,
+        // Setup-screen personality edits: names, trait chips and voices the user
+        // set before starting — the engine merges them into each character's prompt.
+        ...(characterEdits && Object.keys(characterEdits).length ? { character_edits: characterEdits } : {}),
       });
     };
     ws.onmessage = (ev) => {
@@ -423,8 +428,11 @@ export default function StageScreen({
               <button className="btn" onClick={onChangeMode}>
                 Same photo, different mode
               </button>
-              <button className="btn ghost" onClick={onRetake}>
+              <button className="btn" onClick={onRetake}>
                 New photo
+              </button>
+              <button className="btn" onClick={onBackHome}>
+                Home
               </button>
             </div>
           </div>
