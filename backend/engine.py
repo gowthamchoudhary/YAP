@@ -41,7 +41,7 @@ import decider as decider_mod
 import llm
 import scene as scene_mod
 import tts
-from config import backend_dir, require
+from config import backend_dir
 
 LINE_CAP = 40
 SESSION_TTL_S = 600
@@ -179,7 +179,7 @@ class EngineSession:
     # ------------------------------------------------------------------ start
     async def handle_start(self, data: dict[str, Any]) -> None:
         try:
-            require("GROQ_API_KEY", "Needed for the scene + character + dialogue LLMs.")
+            llm.require_text_backend_key()
             sid = str(data.get("scene_id") or "")
             entry = scene_mod.get_scene(sid)
             if not entry:
@@ -622,6 +622,7 @@ class EngineSession:
         t_llm = time.perf_counter()
         self.llm_calls += 1
         obj = await self._generate_line_obj(prompt_msgs, temperature=0.9)
+        llm_backend = obj.get("_llm_backend")
         llm_ms = (time.perf_counter() - t_llm) * 1000
         mood, emoji = self._pick_mood_emoji(obj)
         line = self._sanitize_line(str(obj.get("text") or ""), speaker, max_words)
@@ -641,6 +642,7 @@ class EngineSession:
             if not _too_similar(alt, self.played):
                 line = alt
                 mood, emoji = self._pick_mood_emoji(retry_obj)
+                llm_backend = retry_obj.get("_llm_backend")
 
         if snapshot != self.history_version:
             raise _Stale()  # went stale: discarded, never played, never in history
@@ -685,6 +687,7 @@ class EngineSession:
             "debug": {
                 "decide_ms": round(self.decide_ms, 1),
                 "llm_ms": round(llm_ms, 1),
+                "llm_backend": llm_backend,
                 "tts_ms": round(tts_ms, 1),
                 "first_audio_ms": round(self.first_audio_ms or 0.0, 1),
                 "prefetch_hit": False,
@@ -708,6 +711,7 @@ class EngineSession:
             temperature=temperature,
             response_format={"type": "json_object"},
         )
+        served_backend = llm.last_chat_backend()
         try:
             obj = llm._parse_json(text_raw)
         except Exception:  # noqa: BLE001 - salvage the completed text field from truncated JSON
@@ -724,6 +728,7 @@ class EngineSession:
             obj = {}
         if not isinstance(obj.get("text"), str) or not obj["text"].strip():
             raise RuntimeError(f"Dialogue LLM returned no usable 'text' field: {text_raw[:300]!r}")
+        obj["_llm_backend"] = served_backend
         return obj
 
     def _pick_mood_emoji(self, obj: dict[str, Any]) -> tuple[str, str | None]:
@@ -913,6 +918,7 @@ class EngineSession:
                 max_tokens=400,
                 temperature=1.0,
             )
+            served_backend = llm.last_chat_backend()
             self.llm_calls += 1
         except Exception as exc:  # noqa: BLE001
             await self.send({"type": "error", "code": phase, "message": str(exc)})
@@ -948,6 +954,7 @@ class EngineSession:
             "debug": {
                 "decide_ms": 0.0,
                 "llm_ms": 0.0,
+                "llm_backend": served_backend,
                 "tts_ms": 0.0,
                 "first_audio_ms": round(self.first_audio_ms or 0.0, 1),
                 "prefetch_hit": False,
