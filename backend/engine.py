@@ -30,6 +30,7 @@ one; scripts/test_engine_text_only.py collects into a list instead).
 import asyncio
 import json
 import random
+import re
 import sys
 import time
 import uuid
@@ -103,6 +104,19 @@ def _clean_text(text: str) -> str:
 
 def _token_set(t: str) -> set[str]:
     return {w.lower().strip(".,!?\"'") for w in _words(t) if w.strip(".,!?\"'")}
+
+
+def _too_similar(candidate: str, history: list[dict[str, Any]], threshold: float = 0.7) -> bool:
+    """Reject a line that substantially repeats any of the last eight played lines."""
+    candidate_tokens = _token_set(candidate)
+    if not candidate_tokens:
+        return False
+    for item in history[-8:]:
+        previous_tokens = _token_set(str(item.get("text") or ""))
+        union = candidate_tokens | previous_tokens
+        if union and len(candidate_tokens & previous_tokens) / len(union) > threshold:
+            return True
+    return False
 
 
 class _Stale(Exception):
@@ -316,9 +330,10 @@ class EngineSession:
         # promote a still-valid prefetch
         staged, self.staged = self.staged, None
         if staged and staged.get("snapshot") == self.history_version and not self.ended:
+            staged["debug"]["prefetch_hit"] = True
             self.pending = staged
             asyncio.get_event_loop().create_task(self.send(staged))
-            self._schedule_prefetch()
+        self._schedule_prefetch()
 
     # ------------------------------------------------------------------ reaction / revoice / language
     async def _on_user_reaction(self, data: dict[str, Any]) -> None:
@@ -523,7 +538,6 @@ class EngineSession:
                 quiet_for is not None
                 and quiet_for >= COVER_DISPATCH_QUIET_S
                 and self.cover_lines_left > 0
-                and self.last_event.get("source") == "user"
             ):
                 self.cover_lines_left -= 1
                 self.gen_task = asyncio.create_task(
@@ -538,6 +552,7 @@ class EngineSession:
             ):
                 self.phase = "normal"
                 await self.send({"type": "status", "status": "back to plotting"})
+                self.gen_task = asyncio.create_task(self._produce_and_send(None, None))
             return
 
         if mode_id == "conspiracy" and self.phase == "normal" and not self.user_is_speaking:
@@ -672,6 +687,7 @@ class EngineSession:
                 "llm_ms": round(llm_ms, 1),
                 "tts_ms": round(tts_ms, 1),
                 "first_audio_ms": round(self.first_audio_ms or 0.0, 1),
+                "prefetch_hit": False,
                 "llm_calls": self.llm_calls,
                 "tts_calls": self.tts_calls,
                 "decider": sel_debug,
@@ -686,16 +702,28 @@ class EngineSession:
         """ONE LLM call -> {"text", "mood", "emoji"} (tolerant parse)."""
         text_raw = await llm.chat(
             prompt_msgs,
-            max_tokens=140,
+            # gpt-oss spends part of this output budget on reasoning tokens;
+            # 140 routinely truncates the JSON before its closing quote/object.
+            max_tokens=500,
             temperature=temperature,
             response_format={"type": "json_object"},
         )
         try:
             obj = llm._parse_json(text_raw)
-        except Exception:  # noqa: BLE001 - prose fallback: use the raw line text
-            obj = {"text": text_raw}
+        except Exception:  # noqa: BLE001 - salvage the completed text field from truncated JSON
+            match = re.search(r'"text"\s*:\s*"((?:\\.|[^"\\])*)', text_raw, re.DOTALL)
+            if match:
+                try:
+                    recovered = json.loads(f'"{match.group(1)}"')
+                except json.JSONDecodeError:
+                    recovered = match.group(1)
+                obj = {"text": recovered}
+            else:
+                obj = {}
         if not isinstance(obj, dict):
-            obj = {"text": text_raw}
+            obj = {}
+        if not isinstance(obj.get("text"), str) or not obj["text"].strip():
+            raise RuntimeError(f"Dialogue LLM returned no usable 'text' field: {text_raw[:300]!r}")
         return obj
 
     def _pick_mood_emoji(self, obj: dict[str, Any]) -> tuple[str, str | None]:
@@ -713,7 +741,7 @@ class EngineSession:
             t = first if len(_words(first)) <= max_words else " ".join(toks[:max_words])
             t = _clean_text(t)
         if not t:
-            return f"{speaker['name']} says nothing."
+            raise ValueError(f"Cannot create a spoken line from empty text for {speaker['name']}.")
         return t[0].upper() + t[1:]
 
     def _build_prompt(
@@ -808,9 +836,16 @@ class EngineSession:
                     self.last_gen_error_at = time.time()
                     await self.send({"type": "error", "code": "prefetch", "message": str(exc)})
                     return
-                if line is None or self.pending is not None or self.ended:
+                if line is None or self.ended:
                     return
-                self.staged = line
+                if self.pending is not None:
+                    self.staged = line
+                    return
+                # Playback finished before generation did. Deliver this line
+                # as soon as it is ready and identify it as an on-demand miss.
+                if line.get("snapshot") == self.history_version:
+                    line["debug"]["prefetch_hit"] = False
+                    await self._send_line(line)
 
         self.gen_task = asyncio.create_task(_prefetch())
 
@@ -875,7 +910,7 @@ class EngineSession:
         try:
             text_raw = await llm.chat(
                 self._build_prompt(speaker, extra_hint, max_words, require_json=False),
-                max_tokens=100,
+                max_tokens=400,
                 temperature=1.0,
             )
             self.llm_calls += 1
@@ -915,6 +950,7 @@ class EngineSession:
                 "llm_ms": 0.0,
                 "tts_ms": 0.0,
                 "first_audio_ms": round(self.first_audio_ms or 0.0, 1),
+                "prefetch_hit": False,
                 "llm_calls": self.llm_calls,
                 "tts_calls": self.tts_calls,
                 "decider": {"chosen": speaker["object_id"], "scores": {}, "reason": f"forced ({phase})"},
@@ -938,6 +974,10 @@ class EngineSession:
                 "text": line["text"],
                 "delivery": line.get("delivery"),
             }
+
+    async def _finish(self, ended_by: str) -> None:
+        self.ended_by = ended_by
+        await self._finish_if_needed()
 
     async def _finish_if_needed(self, timeout: bool = False) -> None:
         if self.ended:
