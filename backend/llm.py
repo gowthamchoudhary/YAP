@@ -1,8 +1,4 @@
-"""Provider-agnostic LLM wrapper.
-
-Everything that talks to a *text/vision* model goes through here so the
-provider can be swapped by editing this one file. Current provider: Groq
-(OpenAI-compatible chat completions at https://api.groq.com/openai/v1).
+"""Provider-agnostic LLM wrapper for Groq and AssemblyAI LLM Gateway.
 
 Both functions:
   - are async (driven by engine.py's asyncio tasks),
@@ -11,6 +7,7 @@ Both functions:
 """
 import asyncio
 import base64
+from contextvars import ContextVar
 import json
 import re
 import sys
@@ -22,8 +19,36 @@ import httpx
 import apilog
 from config import get, get_int, require
 
-PROVIDER = "groq"
-BASE_URL = (get("GROQ_BASE_URL", "https://api.groq.com/openai/v1") or "").rstrip("/")
+GROQ_BASE_URL = (get("GROQ_BASE_URL", "https://api.groq.com/openai/v1") or "").rstrip("/")
+GATEWAY_BASE_URL = "https://llm-gateway.assemblyai.com/v1"
+GATEWAY_MODEL = "qwen3.5-4b-32k-fast"
+_last_chat_backend: ContextVar[str | None] = ContextVar("last_chat_backend", default=None)
+
+
+def get_text_backend() -> str:
+    backend = (get("LLM_BACKEND", "groq") or "groq").strip().lower()
+    if backend not in {"groq", "gateway"}:
+        raise ValueError("LLM_BACKEND must be 'groq' or 'gateway'.")
+    return backend
+
+
+def last_chat_backend() -> str | None:
+    """Return the provider that served the most recent chat call in this task."""
+    return _last_chat_backend.get()
+
+
+def require_text_backend_key(backend: str | None = None) -> str:
+    backend = backend or get_text_backend()
+    if backend == "gateway":
+        key = get("ASSEMBLYAI_API_KEY") or get("AAI_TEST_KEY")
+        if key and key.strip():
+            return key.strip()
+        return require("ASSEMBLYAI_API_KEY", "Needed for AssemblyAI LLM Gateway text generation.")
+    if backend != "groq":
+        raise ValueError("LLM_BACKEND must be 'groq' or 'gateway'.")
+    return require(
+        "GROQ_API_KEY", "Get one at https://console.groq.com/keys and put it in backend/.env"
+    )
 
 _client: httpx.AsyncClient | None = None
 
@@ -39,9 +64,8 @@ def _get_client() -> httpx.AsyncClient:
 
 
 def _check_key() -> str:
-    return require(
-        "GROQ_API_KEY", "Get one at https://console.groq.com/keys and put it in backend/.env"
-    )
+    """Groq key for vision requests, which remain on Groq."""
+    return require_text_backend_key("groq")
 
 
 _RETRY_IN_RE = re.compile(r"try again in ([\d.]+)\s*(ms|s)", re.IGNORECASE)
@@ -55,21 +79,26 @@ def _suggested_backoff_s(err_text: str) -> float:
     return min(delay / 1000.0 if m.group(2).lower() == "ms" else delay, 15.0)
 
 
-async def _post(payload: dict[str, Any], service: str) -> dict[str, Any]:
+async def _post(
+    payload: dict[str, Any], service: str, backend: str = "groq"
+) -> dict[str, Any]:
     """POST to chat completions with timing + apilog. Raises on any error.
 
     On a 429 the server-suggested 'try again in <delay>' is honoured with ONE
     patient retry so the provider is never hammered.
     """
-    key = _check_key()
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    key = require_text_backend_key(backend)
+    base_url = GROQ_BASE_URL if backend == "groq" else GATEWAY_BASE_URL
+    auth_value = f"Bearer {key}" if backend == "groq" else key
+    provider = "Groq" if backend == "groq" else "AssemblyAI LLM Gateway"
+    headers = {"Authorization": auth_value, "Content-Type": "application/json"}
     body = json.dumps(payload).encode("utf-8")
     t0 = time.perf_counter()
     status, err, status_code = "ok", None, None
     try:
         for attempt in (1, 2):
             resp = await _get_client().post(
-                f"{BASE_URL}/chat/completions", headers=headers, content=body
+                f"{base_url}/chat/completions", headers=headers, content=body
             )
             status_code = resp.status_code
             if resp.status_code == 429 and attempt == 1:
@@ -83,11 +112,11 @@ async def _post(payload: dict[str, Any], service: str) -> dict[str, Any]:
             break
         if resp.status_code == 401:
             raise RuntimeError(
-                "Groq rejected the API key (401). Check GROQ_API_KEY in backend/.env."
+                f"{provider} rejected the API key (401). Check the configured key in backend/.env."
             )
         if resp.status_code != 200:
             raise RuntimeError(
-                f"Groq chat completions returned {resp.status_code}: {resp.text[:400]}"
+                f"{provider} chat completions returned {resp.status_code}: {resp.text[:400]}"
             )
         return resp.json()
     except Exception as exc:  # noqa: BLE001 - re-raised after logging
@@ -98,7 +127,7 @@ async def _post(payload: dict[str, Any], service: str) -> dict[str, Any]:
         latency = (time.perf_counter() - t0) * 1000
         apilog.log_call(
             service=service,
-            endpoint=f"{BASE_URL}/chat/completions",
+            endpoint=f"{base_url}/chat/completions",
             status=status,
             latency_ms=latency,
             error=err,
@@ -119,14 +148,22 @@ async def chat(
     temperature: float = 0.8,
     model: str | None = None,
     response_format: dict[str, Any] | None = None,
+    backend: str | None = None,
 ) -> str:
-    """One chat completion. Returns assistant text (documented current provider: Groq).
+    """One chat completion through the selected text backend.
 
     `messages` entries may be full {"role", "content"} dicts or bare prompt
-    strings; strings are normalized to user messages here so callers stay simple
-    and Groq always receives objects with the 'role' discriminator.
+    strings; strings are normalized to user messages before sending.
     """
-    model = model or get("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
+    backend = backend or get_text_backend()
+    if backend not in {"groq", "gateway"}:
+        raise ValueError("backend must be 'groq' or 'gateway'.")
+    if model is None:
+        model = (
+            get("GROQ_TEXT_MODEL", "openai/gpt-oss-120b")
+            if backend == "groq"
+            else get("GATEWAY_TEXT_MODEL", GATEWAY_MODEL)
+        )
     normalized = [
         m if isinstance(m, dict) else {"role": "user", "content": str(m)} for m in messages
     ]
@@ -144,27 +181,69 @@ async def chat(
     # those models instead of paying a 400 + full second call per line.
     if response_format and "gpt-oss" in model:
         payload.pop("response_format", None)
-    if "gpt-oss" in model:
+    if backend == "groq" and "gpt-oss" in model:
         # gpt-oss reasoning tokens count against max_tokens, so with the default
         # 'medium' effort the visible JSON/line truncates mid-string. 'low' is the
         # documented Groq knob for conversational gpt-oss workloads.
         payload["reasoning_effort"] = get("GROQ_REASONING_EFFORT", "low")
+
+    async def complete(request_payload: dict[str, Any], provider: str, provider_model: str) -> str:
+        try:
+            data = await _post(
+                request_payload,
+                service=f"{provider}.text[{provider_model}]",
+                backend=provider,
+            )
+        except RuntimeError as exc:
+            # Groq gpt-oss occasionally rejects JSON mode with no sampled reply.
+            # Retry Groq once without JSON mode before using the cross-provider fallback.
+            if provider != "groq" or "json_validate_failed" not in str(exc):
+                raise
+            print(
+                "[llm] json_validate_failed (no reply sampled); retrying without json mode",
+                file=sys.stderr,
+            )
+            request_payload = dict(request_payload)
+            request_payload.pop("response_format", None)
+            data = await _post(
+                request_payload,
+                service=f"{provider}.text[{provider_model}] (no-json retry)",
+                backend=provider,
+            )
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"{provider} returned an unexpected response shape: {data}") from exc
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError(f"{provider} returned an empty chat completion.")
+        return content
+
+    _last_chat_backend.set(None)
     try:
-        data = await _post(payload, service=f"groq.text[{model}]")
-    except RuntimeError as exc:
-        # gpt-oss occasionally returns 400 json_validate_failed with an empty
-        # failed_generation. The provider wrapper retries ONCE without the JSON
-        # mode — every prompt still demands JSON and _parse_json is lenient —
-        # so a single bad sampling can never kill a session.
-        if "json_validate_failed" not in str(exc):
+        content = await complete(payload, backend, model)
+        _last_chat_backend.set(backend)
+        return content
+    except Exception as groq_error:
+        if backend != "groq":
             raise
-        print("[llm] json_validate_failed (no reply sampled); retrying without json mode", file=sys.stderr)
-        payload.pop("response_format", None)
-        data = await _post(payload, service=f"groq.text[{model}] (no-json retry)")
-    try:
-        return data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"Groq returned an unexpected shape: {data}") from exc
+        gateway_model = get("GATEWAY_TEXT_MODEL", GATEWAY_MODEL)
+        gateway_payload = dict(payload)
+        gateway_payload["model"] = gateway_model
+        gateway_payload.pop("reasoning_effort", None)
+        print(
+            f"[llm] Groq text call failed ({type(groq_error).__name__}); "
+            f"retrying once on gateway.text[{gateway_model}]",
+            file=sys.stderr,
+        )
+        try:
+            content = await complete(gateway_payload, "gateway", gateway_model)
+        except Exception as gateway_error:
+            raise RuntimeError(
+                "Groq text call failed and Gateway fallback also failed: "
+                f"{type(gateway_error).__name__}: {gateway_error}"
+            ) from gateway_error
+        _last_chat_backend.set("gateway")
+        return content
 
 
 async def vision(image_bytes: bytes, prompt: str, mime: str = "image/jpeg") -> dict[str, Any]:
@@ -192,7 +271,7 @@ async def vision(image_bytes: bytes, prompt: str, mime: str = "image/jpeg") -> d
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
     }
-    data = await _post(payload, service=f"groq.vision[{model}]")
+    data = await _post(payload, service=f"groq.vision[{model}]", backend="groq")
     try:
         text = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
