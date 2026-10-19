@@ -50,6 +50,8 @@ class FakeClient:
             print(f"  [silent] {obj['speaker_id']} — {obj['reason']}")
         elif t == "ended":
             print(f"  ENDED by={obj['summary']['ended_by']} lines={obj['summary']['lines_spoken']}")
+        elif t == "error":
+            print(f"  ERROR [{obj.get('code')}]: {obj.get('message')}", flush=True)
 
 
 async def main() -> None:
